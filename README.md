@@ -1,0 +1,2 @@
+# contragraph
+Graph contraction framework
