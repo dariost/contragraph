@@ -19,7 +19,6 @@ namespace cg {
 template <typename T = int64_t>
 class Graph {
   protected:
-    const size_t NONE = size_t(-1);
     std::vector<size_t> edge;
     std::vector<T> edge_value;
     std::vector<size_t> edge_offset;
@@ -27,15 +26,17 @@ class Graph {
     std::vector<size_t> edge_parent;
     std::vector<size_t> current_node_pointer;
     std::vector<size_t> current_nodes;
-    std::vector<bool> edge_marked;
+    std::vector<size_t> edge_marked;
     std::vector<size_t> edge_transposed;
     std::vector<size_t> edge_offset_transposed;
     size_t num_nodes;
     std::function<T(const T&, const T&)> fold_function;
     bool self_loops;
+    size_t mark_epoch;
 
     void init(size_t n, const std::vector<std::tuple<size_t, size_t, T>>& edge_list, std::function<T(const T&, const T&)> fold_fun,
               bool no_self_loops) {
+        mark_epoch = 1;
         self_loops = !no_self_loops;
         fold_function = fold_fun;
         num_nodes = n;
@@ -83,14 +84,20 @@ class Graph {
         return node_parent[node] = node_find(node_parent[node]);
     }
 
-    size_t edge_find(size_t edge) {
+    std::tuple<size_t, size_t> edge_find(size_t edge) {
         if(edge_parent[edge] == NONE) {
-            return edge;
+            return {edge, edge_marked[edge]};
         }
-        return edge_parent[edge] = edge_find(edge_parent[edge]);
+        auto [e, m] = edge_find(edge_parent[edge]);
+        m = std::max(m, edge_marked[edge]);
+        edge_parent[edge] = e;
+        edge_marked[edge] = m;
+        return {e, m};
     }
 
   public:
+    const size_t NONE = size_t(-1);
+
     Graph(
         size_t n, const std::vector<std::tuple<size_t, size_t, T>>& edge_list,
         std::function<T(const T&, const T&)> fold_fun = [](const T& a, const T& b) { return a + b; }, bool no_self_loops = true) {
@@ -109,7 +116,32 @@ class Graph {
 
     std::tuple<size_t, const T&> get_edge(size_t node, size_t index) { return {get_edge_neighbour(), get_edge_value()}; }
 
-    void mark_edge(size_t node, size_t index) { edge_marked[edge_offset[node] + index] = true; }
+    void mark_edge(size_t node, size_t index) { edge_marked[edge_offset[node] + index] = mark_epoch; }
+
+    void clear_marks() { mark_epoch++; }
+
+    bool is_marked(size_t node, size_t index) { return edge_marked[edge_offset[node] + index] == mark_epoch; }
+
+    void expand() {
+        size_t m = edge_offset[num_nodes], n = num_nodes;
+        for(size_t i = 0; i < m; i++) {
+            edge_find(i);
+        }
+        edge.resize(m);
+        edge_value.resize(m);
+        node_parent.resize(0);
+        node_parent.resize(n, NONE);
+        edge_parent.resize(0);
+        edge_parent.resize(m, NONE);
+        current_node_pointer.resize(n);
+        std::iota(current_node_pointer.begin(), current_node_pointer.end(), 0UL);
+        current_nodes.resize(n);
+        std::iota(current_nodes.begin(), current_nodes.end(), 0UL);
+        edge_marked.resize(m);
+        edge_transposed.resize(m);
+        edge_offset_transposed.resize(n + 1);
+        edge_offset.resize(n + 1);
+    }
 
     size_t contract(size_t node_a, size_t node_b) {
         assert(node_a != node_b);
@@ -127,10 +159,10 @@ class Graph {
                 }
                 if(mapper.count(true_dest)) {
                     size_t true_i = mapper[true_dest];
-                    edge_parent[edge_find(i)] = true_i;
+                    edge_parent[std::get<0>(edge_find(i))] = true_i;
                     edge_value[true_i] = fold_function(edge_value[true_i], edge_value[i]);
                 } else {
-                    edge_parent[edge_find(i)] = edge.size();
+                    edge_parent[std::get<0>(edge_find(i))] = edge.size();
                     mapper[true_dest] = edge.size();
                     edge_parent.push_back(NONE);
                     edge.push_back(true_dest);
@@ -167,10 +199,10 @@ class Graph {
                 size_t true_dest = node_find(edge[i]);
                 if(mapper.count(true_dest)) {
                     size_t true_i = mapper[true_dest];
-                    edge_parent[edge_find(i)] = true_i;
+                    edge_parent[std::get<0>(edge_find(i))] = true_i;
                     edge_value[true_i] = fold_function(edge_value[true_i], edge_value[i]);
                 } else {
-                    edge_parent[edge_find(i)] = edge.size();
+                    edge_parent[std::get<0>(edge_find(i))] = edge.size();
                     mapper[true_dest] = edge.size();
                     edge_parent.push_back(NONE);
                     edge.push_back(true_dest);
@@ -214,7 +246,7 @@ class Graph {
             s << "graph g { ";
         }
         std::unordered_set<size_t> visited;
-        std::vector<std::tuple<size_t, size_t, int64_t>> edges;
+        std::vector<std::tuple<size_t, size_t, int64_t, bool>> edges;
         std::map<std::tuple<size_t, size_t>, size_t> edge_mapper;
         std::function<void(size_t)> dfs = [&dfs, &visited, &s, &edges, &edge_mapper, &directed, this](size_t node) {
             if(visited.count(node)) {
@@ -224,14 +256,18 @@ class Graph {
             for(size_t i = 0; i < this->get_num_edges(node); i++) {
                 size_t e = this->get_edge_neighbour(node, i);
                 const T& v = this->get_edge_value(node, i);
+                bool m = this->is_marked(node, i);
                 if(directed) {
-                    edges.push_back({node, e, v});
+                    edges.push_back({node, e, v, m});
                 } else {
                     size_t a = std::min(node, e);
                     size_t b = std::max(node, e);
                     if(!edge_mapper.count({a, b})) {
                         edge_mapper[{a, b}] = edges.size();
-                        edges.push_back({a, b, v});
+                        edges.push_back({a, b, v, m});
+                    } else {
+                        auto [x, y, z, w] = edges[edge_mapper[{a, b}]];
+                        std::get<3>(edges[edge_mapper[{a, b}]]) = w || m;
                     }
                 }
                 dfs(e);
@@ -241,11 +277,11 @@ class Graph {
         for(size_t i = 0; i < n; i++) {
             dfs(this->get_node(i));
         }
-        for(const auto [a, b, c] : edges) {
+        for(const auto [a, b, c, d] : edges) {
             if(directed) {
-                s << a << " -> " << b << " [label=" << c << "]; ";
+                s << a << " -> " << b << " [label=" << c << (d ? ",color=magenta" : "") << "]; ";
             } else {
-                s << a << " -- " << b << " [label=" << c << "]; ";
+                s << a << " -- " << b << " [label=" << c << (d ? ",color=magenta" : "") << "]; ";
             }
         }
         s << "}";
